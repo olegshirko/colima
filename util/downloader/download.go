@@ -2,15 +2,21 @@ package downloader
 
 import (
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/abiosoft/colima/config"
 	"github.com/abiosoft/colima/environment"
 	"github.com/abiosoft/colima/util/shautil"
 	"github.com/abiosoft/colima/util/terminal"
+	"github.com/sirupsen/logrus"
 )
 
 type (
@@ -29,13 +35,13 @@ type Request struct {
 // In the implementation, the file is downloaded (and cached) on the host, but copied to the desired
 // destination for the guest.
 // filename must be an absolute path and a directory on the guest that does not require root access.
-func DownloadToGuest(host hostActions, guest guestActions, r Request, filename string) error {
+func DownloadToGuest(host hostActions, guest guestActions, log *logrus.Logger, r Request, filename string) error {
 	// if file is on the filesystem, no need for download. A copy suffices
 	if strings.HasPrefix(r.URL, "/") {
 		return guest.RunQuiet("cp", r.URL, filename)
 	}
 
-	cacheFile, err := Download(host, r)
+	cacheFile, err := Download(host, log, r)
 	if err != nil {
 		return err
 	}
@@ -44,9 +50,10 @@ func DownloadToGuest(host hostActions, guest guestActions, r Request, filename s
 }
 
 // Download downloads file at url and returns the location of the downloaded file.
-func Download(host hostActions, r Request) (string, error) {
+func Download(host hostActions, log *logrus.Logger, r Request) (string, error) {
 	d := downloader{
 		host: host,
+		log:  log,
 	}
 
 	if !d.hasCache(r.URL) {
@@ -60,6 +67,7 @@ func Download(host hostActions, r Request) (string, error) {
 
 type downloader struct {
 	host hostActions
+	log  *logrus.Logger
 }
 
 // CacheFilename returns the computed filename for the url.
@@ -72,39 +80,154 @@ func (d downloader) cacheDownloadingFileName(url string) string {
 }
 
 func (d downloader) downloadFile(r Request) (err error) {
+	d.log.Tracef("downloading %s", r.URL)
+
 	// save to a temporary file initially before renaming to the desired file after successful download
 	// this prevents having a corrupt file
 	cacheDownloadingFilename := d.cacheDownloadingFileName(r.URL)
-	if err := d.host.RunQuiet("mkdir", "-p", filepath.Dir(cacheDownloadingFilename)); err != nil {
-		return fmt.Errorf("error preparing cache dir: %w", err)
-	}
-
-	// get rid of curl's initial progress bar by getting the redirect url directly.
-	downloadURL, err := d.host.RunOutput("curl", "-ILs", "-o", "/dev/null", "-w", "%{url_effective}", r.URL)
-	if err != nil {
-		return fmt.Errorf("error retrieving redirect url: %w", err)
-	}
-
-	// ask curl to resume previous download if possible "-C -"
-	if err := d.host.RunInteractive("curl", "-L", "-#", "-C", "-", "-o", cacheDownloadingFilename, downloadURL); err != nil {
+	if err := os.MkdirAll(filepath.Dir(cacheDownloadingFilename), 0755); err != nil {
+		err = fmt.Errorf("error preparing cache dir: %w", err)
+		d.log.Tracef("error downloading %s: %v", r.URL, err)
 		return err
 	}
-	// clear curl progress line
-	terminal.ClearLine()
+
+	// create file, or open if it exists
+	destFile, err := os.OpenFile(cacheDownloadingFilename, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		err = fmt.Errorf("error creating destination file: %w", err)
+		d.log.Tracef("error downloading %s: %v", r.URL, err)
+		return err
+	}
+	defer destFile.Close()
+
+	// check file size to resume download
+	stat, err := destFile.Stat()
+	if err != nil {
+		err = fmt.Errorf("error getting file stat: %w", err)
+		d.log.Tracef("error downloading %s: %v", r.URL, err)
+		return err
+	}
+	currentSize := stat.Size()
+
+	req, err := http.NewRequest("GET", r.URL, nil)
+	if err != nil {
+		err = fmt.Errorf("error creating request: %w", err)
+		d.log.Tracef("error downloading %s: %v", r.URL, err)
+		return err
+	}
+	if currentSize > 0 {
+		d.log.Tracef("resuming download from byte %d", currentSize)
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", currentSize))
+	}
+
+	// custom transport to avoid timeout on slow connections
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout: 30 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+	client := &http.Client{Transport: transport}
+	resp, err := client.Do(req)
+	if err != nil {
+		err = fmt.Errorf("error during download: %w", err)
+		d.log.Tracef("error downloading %s: %v", r.URL, err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	// if server does not support resume, start from scratch
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		if err := destFile.Truncate(0); err != nil {
+			err = fmt.Errorf("error truncating file: %w", err)
+			d.log.Tracef("error downloading %s: %v", r.URL, err)
+			return err
+		}
+		// reset current size
+		currentSize = 0
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		err = fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		d.log.Tracef("error downloading %s: %v", r.URL, err)
+		return err
+	}
+
+	// seek to the end of file for appending if resumable, otherwise start from scratch
+	if resp.StatusCode == http.StatusPartialContent {
+		if _, err := destFile.Seek(0, io.SeekEnd); err != nil {
+			err = fmt.Errorf("error seeking to end of file: %w", err)
+			d.log.Tracef("error downloading %s: %v", r.URL, err)
+			return err
+		}
+	} else {
+		if _, err := destFile.Seek(0, io.SeekStart); err != nil {
+			err = fmt.Errorf("error seeking to start of file: %w", err)
+			d.log.Tracef("error downloading %s: %v", r.URL, err)
+			return err
+		}
+	}
+
+	// copy stream to file
+	progress := newProgress(d.log, resp.ContentLength+currentSize, currentSize)
+	reader := io.TeeReader(resp.Body, progress)
+
+	if _, err := io.Copy(destFile, reader); err != nil {
+		err = fmt.Errorf("error writing to file: %w", err)
+		d.log.Tracef("error downloading %s: %v", r.URL, err)
+		return err
+	}
 
 	// validate download if sha is present
 	if r.SHA != nil {
 		if err := r.SHA.validateDownload(d.host, r.URL, cacheDownloadingFilename); err != nil {
-
 			// move file to allow subsequent re-download
 			// error discarded, would not be actioned anyways
-			_ = d.host.RunQuiet("mv", cacheDownloadingFilename, cacheDownloadingFilename+".invalid")
-
-			return fmt.Errorf("error validating SHA sum for '%s': %w", path.Base(r.URL), err)
+			_ = os.Rename(cacheDownloadingFilename, cacheDownloadingFilename+".invalid")
+			err = fmt.Errorf("error validating SHA sum for '%s': %w", path.Base(r.URL), err)
+			d.log.Tracef("error downloading %s: %v", r.URL, err)
+			return err
 		}
 	}
 
-	return d.host.RunQuiet("mv", cacheDownloadingFilename, CacheFilename(r.URL))
+	d.log.Tracef("downloaded %s", r.URL)
+	return os.Rename(cacheDownloadingFilename, CacheFilename(r.URL))
+}
+
+// Progress tracks download progress.
+type Progress struct {
+	Total      int64 // total size
+	Current    int64 // downloaded size
+	mu         sync.Mutex
+	lastReport time.Time
+	logger     *logrus.Logger
+}
+
+// newProgress creates a new Progress.
+func newProgress(logger *logrus.Logger, total, current int64) *Progress {
+	return &Progress{
+		Total:   total,
+		Current: current,
+		logger:  logger,
+	}
+}
+
+// Write implements io.Writer.
+func (p *Progress) Write(b []byte) (int, error) {
+	n := len(b)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.Current += int64(n)
+
+	// efficient not to report on every write
+	if time.Since(p.lastReport) < (time.Second / 2) {
+		return n, nil
+	}
+
+	p.lastReport = time.Now()
+	p.logger.Infof("downloading ... %s", terminal.Progress(p.Current, p.Total))
+	return n, nil
 }
 
 func (d downloader) hasCache(url string) bool {

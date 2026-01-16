@@ -67,7 +67,7 @@ func DownloadImage(arch environment.Arch, runtime string) (f limaconfig.File, er
 
 	host := host.New()
 	// download image
-	qcow2, err := downloadImage(host, img)
+	qcow2, err := downloadImage(host, logrus.StandardLogger(), img)
 	if err != nil {
 		return f, err
 	}
@@ -139,13 +139,13 @@ func loadImagesFromBytes(b []byte) error {
 }
 
 // downloadImage downloads the file and returns the location of the downloaded file.
-func downloadImage(host environment.HostActions, file limaconfig.File) (string, error) {
+func downloadImage(host environment.HostActions, log *logrus.Logger, file limaconfig.File) (string, error) {
 	// download image
 	request := downloader.Request{URL: file.Location}
 	if file.Digest != "" {
 		request.SHA = &downloader.SHA{Size: 512, Digest: file.Digest}
 	}
-	location, err := downloader.Download(host, request)
+	location, err := downloader.Download(host, log, request)
 	if err != nil {
 		return "", fmt.Errorf("error during image download: %w", err)
 	}

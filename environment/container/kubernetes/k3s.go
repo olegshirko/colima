@@ -43,15 +43,16 @@ func installK3s(host environment.HostActions,
 	k3sArgs []string,
 	k3sListenPort int,
 ) {
-	installK3sBinary(host, guest, a, k3sVersion)
+	installK3sBinary(host, guest, a, log.Logger, k3sVersion)
 	installK3sCache(host, guest, a, log, containerRuntime, k3sVersion)
-	installK3sCluster(host, guest, a, containerRuntime, k3sVersion, k3sArgs, k3sListenPort)
+	installK3sCluster(host, guest, a, log.Logger, containerRuntime, k3sVersion, k3sArgs, k3sListenPort)
 }
 
 func installK3sBinary(
 	host environment.HostActions,
 	guest environment.GuestActions,
 	a *cli.ActiveCommandChain,
+	log *logrus.Logger,
 	k3sVersion string,
 ) {
 	downloadPath := "/tmp/k3s"
@@ -69,7 +70,7 @@ func installK3sBinary(
 			URL: url,
 			SHA: &downloader.SHA{Size: 256, URL: shaURL},
 		}
-		return downloader.DownloadToGuest(host, guest, r, downloadPath)
+		return downloader.DownloadToGuest(host, guest, log, r, downloadPath)
 	})
 	a.Add(func() error {
 		return guest.Run("sudo", "install", downloadPath, "/usr/local/bin/k3s")
@@ -97,7 +98,7 @@ func installK3sCache(
 			URL: url,
 			SHA: &downloader.SHA{Size: 256, URL: shaURL},
 		}
-		return downloader.DownloadToGuest(host, guest, r, downloadPathTarGz)
+		return downloader.DownloadToGuest(host, guest, log.Logger, r, downloadPathTarGz)
 	})
 	a.Add(func() error {
 		return guest.Run("gzip", "-f", "-d", downloadPathTarGz)
@@ -139,6 +140,7 @@ func installK3sCluster(
 	host environment.HostActions,
 	guest environment.GuestActions,
 	a *cli.ActiveCommandChain,
+	log *logrus.Logger,
 	containerRuntime string,
 	k3sVersion string,
 	k3sArgs []string,
@@ -149,7 +151,7 @@ func installK3sCluster(
 	url := "https://raw.githubusercontent.com/k3s-io/k3s/" + k3sVersion + "/install.sh"
 	a.Add(func() error {
 		r := downloader.Request{URL: url}
-		return downloader.DownloadToGuest(host, guest, r, downloadPath)
+		return downloader.DownloadToGuest(host, guest, logrus.StandardLogger(), r, downloadPath)
 	})
 	a.Add(func() error {
 		return guest.Run("sudo", "install", downloadPath, "/usr/local/bin/k3s-install.sh")

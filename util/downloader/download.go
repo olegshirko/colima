@@ -226,7 +226,8 @@ func (p *Progress) Write(b []byte) (int, error) {
 	}
 
 	p.lastReport = time.Now()
-	p.logger.Infof("downloading ... %s", terminal.Progress(p.Current, p.Total))
+	// no new line
+	fmt.Printf("\rdownloading ... %s ", terminal.Progress(p.Current, p.Total))
 	return n, nil
 }
 
